@@ -8,7 +8,7 @@
 
 1. 装一个脚本管理器：[Tampermonkey 油猴](https://www.tampermonkey.net/)（Chrome、Edge、Firefox、Safari）或 [Violentmonkey 暴力猴](https://violentmonkey.github.io/)。
 2. Chrome / Edge 要在扩展页（`chrome://extensions` 或 `edge://extensions`）右上角打开**开发者模式**，油猴才能运行脚本。
-3. 打开 [`fab-library-claimer.user.js`](fab-library-claimer.user.js)，点 **Raw**，油猴会弹出安装页。也可以在油猴里新建脚本，把整个文件粘进去保存。
+3. 点 **[安装脚本](https://raw.githubusercontent.com/akifukaku-ai/fab-library-claimer/main/fab-library-claimer.user.js)**，油猴会打开安装页，点**安装**。也可以在油猴里新建脚本，把整个文件粘进去保存。
 
 ## 使用
 

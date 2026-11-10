@@ -1,6 +1,9 @@
 // ==UserScript==
 // @name         Fab Free Library Claimer
-// @namespace    https://github.com/fab-library-claimer
+// @namespace    https://github.com/akifukaku-ai/fab-library-claimer
+// @homepageURL  https://github.com/akifukaku-ai/fab-library-claimer
+// @downloadURL  https://raw.githubusercontent.com/akifukaku-ai/fab-library-claimer/main/fab-library-claimer.user.js
+// @updateURL    https://raw.githubusercontent.com/akifukaku-ai/fab-library-claimer/main/fab-library-claimer.user.js
 // @version      1.0.0
 // @description  Add every free listing of a Fab seller to your library.
 // @match        https://www.fab.com/*

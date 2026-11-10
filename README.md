@@ -8,7 +8,7 @@ A single-file userscript that adds every free listing of a Fab seller to your li
 
 1. Install a userscript manager: [Tampermonkey](https://www.tampermonkey.net/) (Chrome, Edge, Firefox, Safari) or [Violentmonkey](https://violentmonkey.github.io/).
 2. In Chrome or Edge, turn on **Developer mode** on the extensions page (`chrome://extensions` or `edge://extensions`). Tampermonkey needs it to run scripts.
-3. Open [`fab-library-claimer.user.js`](fab-library-claimer.user.js), click **Raw**, and Tampermonkey will offer to install it. Or create a new script in Tampermonkey and paste the whole file in.
+3. Click **[Install the script](https://raw.githubusercontent.com/akifukaku-ai/fab-library-claimer/main/fab-library-claimer.user.js)**. Tampermonkey opens its install page; click **Install**. Or create a new script in Tampermonkey and paste the whole file in.
 
 ## Use
 
