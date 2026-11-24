@@ -4,7 +4,7 @@
 // @homepageURL  https://github.com/akifukaku-ai/fab-library-claimer
 // @downloadURL  https://raw.githubusercontent.com/akifukaku-ai/fab-library-claimer/main/fab-library-claimer.user.js
 // @updateURL    https://raw.githubusercontent.com/akifukaku-ai/fab-library-claimer/main/fab-library-claimer.user.js
-// @version      1.1.0
+// @version      1.2.0
 // @description  Add every free listing of a Fab seller to your library.
 // @match        https://www.fab.com/*
 // @grant        none
@@ -16,15 +16,20 @@
   'use strict';
 
   const STORE_KEY = 'fab-claimer-state';
-  const CLAIM_DELAY_BASE = 1500;
-  const CLAIM_DELAY_JITTER = 800;
-  const PAGE_DELAY = 1200;
   const DEFAULT_SELLER_URL = 'https://www.fab.com/sellers/Quixel%20Megascans';
+  // Measured 2026-11-25: Fab allows about 100 adds per minute. Going over answers 429 with a
+  // Retry-After of a few seconds; going over again soon after answers Retry-After 600 (10-minute lock).
+  // Scanning (search, listings-states) is not limited. So: add at a steady pace just under
+  // 100/min and never trip the limit. Each 429 still slows the pace by 10% for the rest of the run.
+  const PACE_START_MS = 700; // ~86 adds per minute
+  const PACE_MAX_MS = 30000;
+  const LONG_LOCK_SEC = 60;
 
   let running = false;
   let ui = null;
   let cooldownUntil = 0;
-  let backoffStep = 0;
+  let pace = PACE_START_MS;
+  let run = null; // live numbers for the current run
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -38,46 +43,32 @@
     return m ? decodeURIComponent(m[1]) : '';
   };
 
+  const freshState = (seller) => ({ seller, cursor: null, scanned: 0, owned: 0, added: 0, failed: 0, done: false });
+
   const loadState = (seller) => {
     try {
       const s = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
-      if (s && s.seller === seller) return s;
+      if (s && s.seller === seller) return Object.assign(freshState(seller), s);
     } catch (e) {}
-    return { seller, cursor: null, scanned: 0, owned: 0, added: 0, failed: 0, done: false };
+    return freshState(seller);
   };
 
   const saveState = (s) => {
     try { localStorage.setItem(STORE_KEY, JSON.stringify(s)); } catch (e) {}
   };
 
-  async function waitCooldown(state) {
-    while (running && Date.now() < cooldownUntil) {
-      if (ui) render(state);
-      await sleep(1000);
-    }
-    if (ui) render(state);
+  const retryAfter = (res, fallback) => {
+    const v = parseInt(res.headers.get('retry-after'), 10);
+    return !isNaN(v) && v >= 0 ? v : fallback;
+  };
+
+  async function sleepWhileRunning(ms) {
+    const end = Date.now() + ms;
+    while (running && Date.now() < end) await sleep(Math.min(1000, end - Date.now()));
   }
 
-  function handleRateLimit(res) {
-    backoffStep++;
-    let waitSec = 0;
-    const header = res && res.headers && res.headers.get('retry-after');
-    if (header) {
-      const parsed = parseInt(header, 10);
-      if (!isNaN(parsed) && parsed > 0) waitSec = parsed;
-    }
-    if (!waitSec) {
-      waitSec = Math.min(60 * Math.pow(2, backoffStep - 1), 300);
-    }
-    cooldownUntil = Date.now() + waitSec * 1000;
-    log(`HTTP 429 Rate limited. Cooling down for ${waitSec}s`);
-  }
-
-  async function request(url, opts = {}, state = null) {
+  async function request(url, opts = {}) {
     while (running) {
-      await waitCooldown(state);
-      if (!running) throw new Error('Stopped');
-
       let res;
       try {
         res = await fetch(url, {
@@ -92,126 +83,157 @@
         });
       } catch (e) {
         log(`Network error: ${e.message}, retry in 5s`);
-        await sleep(5000);
+        await sleepWhileRunning(5000);
         continue;
       }
-
-      if (res.status === 429) {
-        handleRateLimit(res);
-        continue;
-      }
-
       if (res.status >= 500) {
         log(`HTTP ${res.status}, retry in 10s`);
-        await sleep(10000);
+        await sleepWhileRunning(10000);
         continue;
       }
-
       return res;
     }
     throw new Error('Stopped');
   }
 
-  async function fetchPage(seller, cursor, state) {
+  // ---------- scanning: walks every page as fast as Fab answers (not rate-limited) ----------
+
+  async function fetchPage(seller, cursor) {
     const p = new URLSearchParams({ seller, is_free: '1', sort_by: '-firstPublishedAt' });
     if (cursor) p.set('cursor', cursor);
-    const res = await request('/i/listings/search?' + p.toString(), {}, state);
-    if (!res.ok) throw new Error('Search failed: HTTP ' + res.status);
-    const j = await res.json();
-    let next = null;
-    if (j.next) next = new URL(j.next, location.origin).searchParams.get('cursor');
-    else if (j.cursors && j.cursors.next) next = j.cursors.next;
-    return { items: j.results || [], next };
+    for (;;) {
+      const res = await request('/i/listings/search?' + p.toString());
+      if (res.status === 429) { await sleepWhileRunning(retryAfter(res, 10) * 1000 + 500); continue; }
+      if (!res.ok) throw new Error('Search failed: HTTP ' + res.status);
+      const j = await res.json();
+      let next = null;
+      if (j.next) next = new URL(j.next, location.origin).searchParams.get('cursor');
+      else if (j.cursors && j.cursors.next) next = j.cursors.next;
+      return { items: j.results || [], next };
+    }
   }
 
-  async function fetchOwned(uids, state) {
+  async function fetchOwned(uids) {
     if (!uids.length) return new Set();
     const q = uids.map((u) => 'listing_ids=' + encodeURIComponent(u)).join('&');
-    const res = await request('/i/users/me/listings-states?' + q, {}, state);
-    if (res.status === 401 || res.status === 403) throw new Error('Please sign in to Fab first.');
-    if (!res.ok) return new Set();
-    const j = await res.json();
-    const list = Array.isArray(j) ? j : j.results || [];
-    return new Set(list.filter((x) => x.acquired).map((x) => x.uid));
+    for (;;) {
+      const res = await request('/i/users/me/listings-states?' + q);
+      if (res.status === 429) { await sleepWhileRunning(retryAfter(res, 10) * 1000 + 500); continue; }
+      if (res.status === 401 || res.status === 403) throw new Error('Please sign in to Fab first.');
+      if (!res.ok) return new Set();
+      const j = await res.json();
+      const list = Array.isArray(j) ? j : j.results || [];
+      return new Set(list.filter((x) => x.acquired).map((x) => x.uid));
+    }
   }
 
-  async function addToLibrary(item, state) {
+  async function scanner(seller, startCursor) {
+    let cursor = startCursor;
+    while (running) {
+      const { items, next } = await fetchPage(seller, cursor);
+      const free = items.filter((x) => !x.startingPrice || x.startingPrice.price === 0);
+      const owned = await fetchOwned(free.map((x) => x.uid));
+      const todo = free.filter((x) => !owned.has(x.uid));
+      run.pages.push({ scanned: items.length, owned: free.length - todo.length, todo, next });
+      run.queued += todo.length;
+      run.scanned += items.length;
+      run.wake();
+      if (!next) break;
+      cursor = next;
+    }
+    run.scanDone = true;
+    run.wake();
+  }
+
+  // ---------- adding: steady pace, tuned by Fab's own Retry-After ----------
+
+  async function addToLibrary(item, s) {
     const offerId = (item.startingPrice && item.startingPrice.offerId) || item.offerId;
     if (!offerId) return false;
-    const body = new FormData();
-    body.append('offer_id', offerId);
-    const res = await request(`/i/listings/${item.uid}/add-to-library`, { method: 'POST', body }, state);
-    if (res.status === 401 || res.status === 403) throw new Error('Please sign in to Fab first.');
-    if (res.ok) {
-      backoffStep = 0;
-      return true;
+    for (;;) {
+      const wait = run.nextAt - Date.now();
+      if (wait > 0) await sleepWhileRunning(wait);
+      if (!running) throw new Error('Stopped');
+      run.nextAt = Date.now() + pace;
+      const body = new FormData();
+      body.append('offer_id', offerId);
+      const res = await request(`/i/listings/${item.uid}/add-to-library`, { method: 'POST', body });
+      if (res.status === 401 || res.status === 403) throw new Error('Please sign in to Fab first.');
+      if (res.status === 429) {
+        const sec = retryAfter(res, 60);
+        pace = Math.min(PACE_MAX_MS, Math.round(pace * (sec >= LONG_LOCK_SEC ? 1.25 : 1.1)));
+        log(`Fab rate limit: waiting ${fmtDur(sec)}, then ${(60000 / pace).toFixed(0)}/min.`);
+        cooldownUntil = Date.now() + sec * 1000 + 1000 + Math.floor(Math.random() * 1000);
+        await sleepWhileRunning(cooldownUntil - Date.now());
+        cooldownUntil = 0;
+        continue;
+      }
+      if (res.ok) return true;
+      return false;
     }
-    return false;
   }
 
-  async function run() {
+  async function start() {
     const seller = sellerFromUrl();
     if (!seller) return log('Open a seller page, e.g. /sellers/Quixel%20Megascans');
     if (running) return;
     running = true;
     cooldownUntil = 0;
-    backoffStep = 0;
-    render();
     const s = loadState(seller);
-    if (s.done) Object.assign(s, { cursor: null, scanned: 0, owned: 0, added: 0, failed: 0, done: false });
+    if (s.done) Object.assign(s, freshState(seller));
+    pace = PACE_START_MS;
+    let wakeUp = null;
+    run = {
+      startedAt: Date.now(), addsAtStart: s.added, pages: [], queued: 0, processed: 0, scanned: 0, scanDone: false,
+      nextAt: 0,
+      wake: () => { if (wakeUp) { wakeUp(); wakeUp = null; } },
+    };
+    render(s);
     log(`Start: ${seller}`);
+    const scan = scanner(seller, s.cursor).catch((e) => { if (running) { log(e.message); running = false; } run.scanDone = true; run.wake(); });
     try {
       while (running) {
-        const { items, next } = await fetchPage(seller, s.cursor, s);
-        const free = items.filter((x) => !x.startingPrice || x.startingPrice.price === 0);
-        const owned = await fetchOwned(free.map((x) => x.uid), s);
-        const todo = free.filter((x) => !owned.has(x.uid));
-        s.scanned += items.length;
-        s.owned += free.length - todo.length;
-        render(s);
-
-        for (const item of todo) {
-          if (!running) break;
-          let ok = false;
-          try {
-            ok = await addToLibrary(item, s);
-          } catch (e) {
-            if (!running) break;
-            throw e;
-          }
-          if (ok) {
-            s.added++;
-            log('Added: ' + item.title);
-          } else if (running) {
-            s.failed++;
-            log('Failed: ' + item.title);
-          }
+        if (!run.pages.length) {
+          if (run.scanDone) break;
+          await new Promise((r) => { wakeUp = r; setTimeout(r, 1000); });
+          continue;
+        }
+        const page = run.pages[0];
+        while (running && page.todo.length) {
+          const item = page.todo[0];
+          let ok;
+          try { ok = await addToLibrary(item, s); } catch (e) { if (!running) break; throw e; }
+          page.todo.shift();
+          run.processed++;
+          if (ok) { s.added++; log('Added: ' + item.title); }
+          else { s.failed++; log('Failed: ' + item.title); }
           saveState(s);
           render(s);
-          if (ok && running) {
-            const delay = CLAIM_DELAY_BASE + Math.floor(Math.random() * CLAIM_DELAY_JITTER);
-            await sleep(delay);
-          }
         }
-
         if (!running) break;
-        s.cursor = next;
+        run.pages.shift();
+        s.scanned += page.scanned;
+        s.owned += page.owned;
+        s.cursor = page.next;
+        if (!page.next) { s.done = true; log('Finished.'); }
         saveState(s);
         render(s);
-        if (!next) { s.done = true; saveState(s); log('Finished.'); break; }
-        await sleep(PAGE_DELAY);
       }
     } catch (e) {
       log(e.message);
     }
     running = false;
+    cooldownUntil = 0;
+    run.wake();
+    await scan;
     render(s);
   }
 
   function stop() {
     running = false;
     cooldownUntil = 0;
-    log('Stopping after current request...');
+    if (run) run.wake();
+    log('Stopping...');
     render();
   }
 
@@ -230,21 +252,42 @@
     while (ui.log.childNodes.length > 200) ui.log.lastChild.remove();
   }
 
+  function fmtDur(sec) {
+    sec = Math.max(0, Math.round(sec));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    if (h) return `${h}h ${m}m`;
+    if (m) return `${m}m ${String(sec % 60).padStart(2, '0')}s`;
+    return `${sec}s`;
+  }
+
+  function progressLine(s) {
+    if (!running || !run) return '';
+    const left = run.queued - run.processed;
+    const elapsed = (Date.now() - run.startedAt) / 1000;
+    const done = s.added - run.addsAtStart;
+    // Measured speed once there is enough data, the planned pace before that.
+    const perMin = done >= 20 && elapsed > 60 ? (done / elapsed) * 60 : 60000 / pace;
+    let text = run.scanDone ? `${left} left` : `${left}+ left (scanning, ${run.scanned} checked)`;
+    text += ` · ${perMin.toFixed(0)}/min`;
+    if (left > 0) text += ` · ETA ${run.scanDone ? '' : '≥ '}${fmtDur((left / perMin) * 60)}`;
+    const now = Date.now();
+    if (cooldownUntil > now) text += ` · Fab pause ${fmtDur((cooldownUntil - now) / 1000)}`;
+    return text;
+  }
+
   function render(s) {
     if (!ui) return;
     const seller = sellerFromUrl();
     s = s || loadState(seller);
     if (!seller) {
       ui.stats.textContent = 'Open a seller page to start, e.g. Quixel Megascans.';
+      ui.progress.textContent = '';
     } else {
       let text = `Scanned ${s.scanned} · Owned ${s.owned} · Added ${s.added} · Failed ${s.failed}`;
       if (s.done) text += ' · Done';
-      const now = Date.now();
-      if (running && cooldownUntil > now) {
-        const remaining = Math.ceil((cooldownUntil - now) / 1000);
-        text += ` · Cooldown ${remaining}s`;
-      }
       ui.stats.textContent = text;
+      ui.progress.textContent = progressLine(s);
     }
     ui.box.classList.toggle('off', !seller);
     ui.start.textContent = s.cursor && !s.done ? 'Resume' : 'Start';
@@ -269,6 +312,8 @@
         #fab-claimer .gorow{display:none}
         #fab-claimer.off .gorow{display:flex}
         #fab-claimer.off .ctl{display:none}
+        #fab-claimer .progress{color:#8fb8ff}
+        #fab-claimer .progress:empty{display:none}
         #fab-claimer .log{max-height:140px;overflow:auto;color:#aaa;font-family:ui-monospace,monospace;font-size:11px}
         #fab-claimer.min .log,#fab-claimer.min .row,#fab-claimer.min .stats{display:none}
         #fab-claimer .x{position:absolute;right:10px;top:8px;cursor:pointer;color:#888}
@@ -276,6 +321,7 @@
       <span class="x">–</span>
       <b>Fab Free Library Claimer</b>
       <div class="stats"></div>
+      <div class="progress"></div>
       <div class="row ctl">
         <button class="start">Start</button>
         <button class="stop alt">Stop</button>
@@ -288,6 +334,7 @@
     document.body.appendChild(box);
     ui = {
       stats: box.querySelector('.stats'),
+      progress: box.querySelector('.progress'),
       start: box.querySelector('.start'),
       stop: box.querySelector('.stop'),
       reset: box.querySelector('.reset'),
@@ -295,7 +342,7 @@
     };
     ui.box = box;
     box.querySelector('.go').onclick = () => { location.href = DEFAULT_SELLER_URL; };
-    ui.start.onclick = run;
+    ui.start.onclick = start;
     ui.stop.onclick = stop;
     ui.reset.onclick = reset;
     box.querySelector('.x').onclick = () => box.classList.toggle('min');
@@ -305,10 +352,9 @@
   let lastPath = location.pathname;
   setInterval(() => {
     if (!document.getElementById('fab-claimer')) mount();
-    if (location.pathname !== lastPath) {
-      lastPath = location.pathname;
-      if (!running) render();
-    }
+    if (running) render();
+    else if (location.pathname !== lastPath) render();
+    lastPath = location.pathname;
   }, 1000);
   mount();
 })();

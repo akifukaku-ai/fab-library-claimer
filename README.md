@@ -15,12 +15,12 @@ A single-file userscript that adds every free listing of a Fab seller to your li
 1. Sign in at [fab.com](https://www.fab.com).
 2. Open the [Quixel Megascans seller page](https://www.fab.com/sellers/Quixel%20Megascans). On any other Fab page the panel shows an **Open Quixel Megascans** button that takes you there.
 3. Click **Start** in the panel at the bottom-right corner.
-4. Keep the tab open. The panel shows how many listings were scanned, already owned, added and failed.
+4. Keep the tab open. The panel shows how many listings were scanned, already owned, added and failed, plus how many are left, the current speed and the estimated time left.
 
 | Button | What it does |
 |---|---|
 | Start / Resume | Starts, or continues from the last saved page |
-| Stop | Stops after the current batch |
+| Stop | Stops after the current request |
 | Reset | Clears saved progress and starts over next time |
 | – | Collapses the panel |
 
@@ -28,7 +28,8 @@ A single-file userscript that adds every free listing of a Fab seller to your li
 
 - Listings you already own are skipped, so running it again is safe. Run it once more after a few days to pick up listings that turned free later.
 - Progress is saved after every page. Closing the tab or the browser loses at most one page of work.
-- A full run of 23,000 listings takes a while. If Fab rate-limits you, the script waits and retries on its own.
+- Fab allows about 100 adds per minute per account; going over it twice in a row locks adding for 10 minutes. The script adds at a steady ~85 per minute so it never hits that lock. A full run of 23,000 listings takes about 4.5 hours, and no setting or script can make it much faster. If Fab still rate-limits you, the script waits exactly as long as Fab asks and slows down a little.
+- Scanning runs ahead of adding and is not limited, so the estimate becomes exact once scanning finishes.
 - Nothing is downloaded. Assets only go into your Fab library; download them later from Fab, Unreal Engine or Bridge.
 - The script talks only to fab.com, using your own signed-in session. It collects nothing.
 
